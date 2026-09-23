@@ -1,0 +1,99 @@
+name: 发布 macOS 桌面端预发布版
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 桌面端语义版本号，不带 v 前缀
+        required: true
+        type: string
+      commit_sha:
+        description: 私有源码仓库中完整的 40 位小写 commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  macos-dmg:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DESKTOP_VERSION: ${{ inputs.version }}
+      DESKTOP_COMMIT: ${{ inputs.commit_sha }}
+      RELEASE_TAG: desktop-mac-v${{ inputs.version }}
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+    steps:
+      - name: 校验发布参数
+        shell: bash
+        run: |
+          [[ "$DESKTOP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo '桌面端版本号无效'; exit 1; }
+          [[ "$DESKTOP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '必须提供完整的 40 位小写 commit SHA'; exit 1; }
+
+      - name: 检出指定源码提交
+        uses: actions/checkout@v5
+        with:
+          repository: cj620/ai-rpa
+          ref: ${{ inputs.commit_sha }}
+          ssh-key: ${{ secrets.AI_RPA_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: 复核源码提交
+        shell: bash
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$DESKTOP_COMMIT" ]] || { echo '检出提交与发布参数不一致'; exit 1; }
+          echo "源码提交：$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 准备 Node 和 pnpm
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22.18.0
+
+      - name: 启用 pnpm
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.7.0 --activate
+          pnpm --version
+
+      - name: 安装依赖与 Electron 内核
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile
+          node apps/desktop/node_modules/electron/install.js
+          test -x apps/desktop/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron
+
+      - name: 写入桌面端版本
+        shell: bash
+        run: |
+          node -e 'const fs = require("node:fs"); const path = "apps/desktop/package.json"; const pkg = JSON.parse(fs.readFileSync(path, "utf8")); pkg.version = process.env.DESKTOP_VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n")'
+
+      - name: 构建并冒烟验证 DMG
+        run: pnpm desktop:package:mac
+
+      - name: 校验 DMG
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmgs=(apps/desktop/release/*.dmg)
+          [[ ${#dmgs[@]} -eq 1 ]] || { echo "应当生成一个 DMG，实际为 ${#dmgs[@]} 个"; exit 1; }
+          checksum_path="${dmgs[0]}.sha256"
+          (cd "$(dirname "${dmgs[0]}")" && shasum -a 256 "$(basename "${dmgs[0]}")") | tee "$checksum_path" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 发布 GitHub Pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          dmgs=(apps/desktop/release/*.dmg)
+          gh release create "$RELEASE_TAG" \
+            "${dmgs[0]}#Apple Silicon DMG" \
+            "${dmgs[0]}.sha256#SHA-256 checksum" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "xiaoyuan-rpa Desktop ${DESKTOP_VERSION} for macOS" \
+            --notes "Apple Silicon 内部验收版。源码提交：${DESKTOP_COMMIT}。当前未进行 Apple Developer ID 签名或公证。" \
+            --prerelease
