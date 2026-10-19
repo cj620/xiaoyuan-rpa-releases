@@ -72,8 +72,8 @@ jobs:
         shell: bash
         run: |
           pnpm --filter @ai-rpa/local-development test
-          pnpm --filter @ai-rpa/desktop test -- src/config src/update
-          pnpm --filter @ai-rpa/desktop-cli test -- src/doctor.test.ts
+          pnpm --filter @ai-rpa/desktop test
+          pnpm --filter @ai-rpa/desktop-cli test
           pnpm --filter @ai-rpa/local-development --filter @ai-rpa/desktop --filter @ai-rpa/desktop-cli typecheck
           pnpm --filter @ai-rpa/local-development --filter @ai-rpa/desktop lint
       - name: 写入共同版本
