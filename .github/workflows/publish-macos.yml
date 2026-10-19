@@ -1,37 +1,50 @@
-name: 发布 macOS 桌面端预发布版
+name: 发布 macOS 与 Ubuntu 桌面端预发布版
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 桌面端语义版本号，不带 v 前缀
+        description: 两端共同使用的语义版本号，不带 v 前缀
         required: true
         type: string
       commit_sha:
         description: 私有源码仓库中完整的 40 位小写 commit SHA
         required: true
         type: string
+      publish:
+        description: 检查通过后发布 Pre-release（关闭时只保留安装包供验收）
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
-
+  contents: read
+concurrency:
+  group: desktop-${{ inputs.version }}
+  cancel-in-progress: false
 jobs:
-  macos-dmg:
-    runs-on: macos-15
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: mac
+            extension: dmg
+          - os: ubuntu-24.04
+            platform: linux
+            extension: deb
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       DESKTOP_VERSION: ${{ inputs.version }}
       DESKTOP_COMMIT: ${{ inputs.commit_sha }}
-      RELEASE_TAG: desktop-mac-v${{ inputs.version }}
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
-
     steps:
       - name: 校验发布参数
         shell: bash
         run: |
-          [[ "$DESKTOP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo '桌面端版本号无效'; exit 1; }
-          [[ "$DESKTOP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '必须提供完整的 40 位小写 commit SHA'; exit 1; }
-
+          [[ "$DESKTOP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 1
+          [[ "$DESKTOP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
       - name: 检出指定源码提交
         uses: actions/checkout@v5
         with:
@@ -39,62 +52,109 @@ jobs:
           ref: ${{ inputs.commit_sha }}
           ssh-key: ${{ secrets.AI_RPA_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
-
       - name: 复核源码提交
         shell: bash
         run: |
-          [[ "$(git rev-parse HEAD)" == "$DESKTOP_COMMIT" ]] || { echo '检出提交与发布参数不一致'; exit 1; }
-          echo "源码提交：$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 准备 Node 和 pnpm
-        uses: actions/setup-node@v5
+          [[ "$(git rev-parse HEAD)" == "$DESKTOP_COMMIT" ]] || exit 1
+          echo "源码提交：$DESKTOP_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-node@v5
         with:
           node-version: 22.18.0
           package-manager-cache: false
-
-      - name: 启用 pnpm
+      - name: 安装依赖与 Electron 内核
         shell: bash
         run: |
           corepack enable
           corepack prepare pnpm@11.7.0 --activate
-          pnpm --version
-
-      - name: 安装依赖与 Electron 内核
-        shell: bash
-        run: |
           pnpm install --frozen-lockfile
           node apps/desktop/node_modules/electron/install.js
-          test -x apps/desktop/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron
-
-      - name: 写入桌面端版本
+      - name: 平台适配回归与静态检查
+        shell: bash
+        run: |
+          pnpm --filter @ai-rpa/local-development test
+          pnpm --filter @ai-rpa/desktop test -- src/config src/update
+          pnpm --filter @ai-rpa/desktop-cli test -- src/doctor.test.ts
+          pnpm --filter @ai-rpa/local-development --filter @ai-rpa/desktop --filter @ai-rpa/desktop-cli typecheck
+          pnpm --filter @ai-rpa/local-development --filter @ai-rpa/desktop lint
+      - name: 写入共同版本
         shell: bash
         run: |
           node -e 'const fs = require("node:fs"); const path = "apps/desktop/package.json"; const pkg = JSON.parse(fs.readFileSync(path, "utf8")); pkg.version = process.env.DESKTOP_VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n")'
-
-      - name: 构建并冒烟验证 DMG
+      - name: 构建并验证 macOS
+        if: matrix.platform == 'mac'
         run: pnpm desktop:package:mac
-
-      - name: 校验 DMG
+      - name: 准备 Ubuntu 桌面依赖
+        if: matrix.platform == 'linux'
         shell: bash
         run: |
-          shopt -s nullglob
-          dmgs=(apps/desktop/release/*.dmg)
-          [[ ${#dmgs[@]} -eq 1 ]] || { echo "应当生成一个 DMG，实际为 ${#dmgs[@]} 个"; exit 1; }
-          checksum_path="${dmgs[0]}.sha256"
-          (cd "$(dirname "${dmgs[0]}")" && shasum -a 256 "$(basename "${dmgs[0]}")") | tee "$checksum_path" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 发布 GitHub Pre-release
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring dbus-x11 libsecret-1-0 libgtk-3-0t64 libnss3 libgbm1 libasound2t64 fonts-noto-cjk
+          test -x /usr/bin/google-chrome
+      - name: 构建并验证 Ubuntu
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            printf "%s" "isolated-ci-keyring" | gnome-keyring-daemon --unlock --components=secrets
+            pnpm desktop:package:linux
+          '
+      - name: 校验安装产物
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
+          EXTENSION: ${{ matrix.extension }}
         run: |
           shopt -s nullglob
-          dmgs=(apps/desktop/release/*.dmg)
-          gh release create "$RELEASE_TAG" \
-            "${dmgs[0]}#Apple Silicon DMG" \
-            "${dmgs[0]}.sha256#SHA-256 checksum" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "xiaoyuan-rpa Desktop ${DESKTOP_VERSION} for macOS" \
-            --notes "Apple Silicon 内部验收版。源码提交：${DESKTOP_COMMIT}。当前未进行 Apple Developer ID 签名或公证。" \
-            --prerelease
+          packages=(apps/desktop/release/*.$EXTENSION)
+          [[ ${#packages[@]} -eq 1 ]] || exit 1
+          expected="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg"
+          if [[ "$PLATFORM" == linux ]]; then
+            expected="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"
+            [[ "$(dpkg-deb -f "${packages[0]}" Architecture)" == amd64 ]]
+            dpkg-deb -c "${packages[0]}" > /tmp/desktop-package-files
+            grep -q './usr/bin/ai-rpa$' /tmp/desktop-package-files
+          fi
+          [[ "$(basename "${packages[0]}")" == "$expected" ]]
+          mkdir -p release-upload
+          cp "${packages[0]}" release-upload/
+          (cd release-upload && shasum -a 256 "$expected" > "$expected.sha256")
+          cat "release-upload/$expected.sha256" >> "$GITHUB_STEP_SUMMARY"
+      - name: 仅保存安装包与校验值
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: release-upload/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      DESKTOP_VERSION: ${{ inputs.version }}
+      DESKTOP_COMMIT: ${{ inputs.commit_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: release-upload
+      - name: 发布两端共同的 Pre-release
+        shell: bash
+        run: |
+          cd release-upload
+          dmg="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg"
+          deb="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"
+          test -s "$dmg" && test -s "$deb"
+          sha256sum -c "$dmg.sha256" "$deb.sha256"
+          printf 'macOS Apple Silicon 与 Ubuntu 24.04 x86_64 内部验收版。\n\n共同源码提交：%s。\n\nmacOS 尚未进行 Apple Developer ID 签名或公证。Ubuntu 使用 DEB 安装，包含 ai-rpa CLI，需要已登录并解锁密钥环的桌面会话。\n' "$DESKTOP_COMMIT" > /tmp/release-notes.md
+          gh release create "desktop-mac-v${DESKTOP_VERSION}" \
+            "$dmg#macOS Apple Silicon DMG" "$dmg.sha256#macOS SHA-256" \
+            "$deb#Ubuntu x86_64 DEB" "$deb.sha256#Ubuntu SHA-256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "xiaoyuan-rpa ${DESKTOP_VERSION} for macOS and Ubuntu" \
+            --notes-file /tmp/release-notes.md --prerelease
