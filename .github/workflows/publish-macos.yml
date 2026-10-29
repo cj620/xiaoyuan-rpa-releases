@@ -1,10 +1,10 @@
-name: 发布 macOS 与 Ubuntu 桌面端预发布版
+name: 发布 Windows、macOS 与 Ubuntu 桌面端
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 两端共同使用的语义版本号，不带 v 前缀
+        description: 三端共同使用的语义版本号，不带 v 前缀
         required: true
         type: string
       commit_sha:
@@ -12,9 +12,14 @@ on:
         required: true
         type: string
       publish:
-        description: 检查通过后发布 Pre-release（关闭时只保留安装包供验收）
+        description: 三端检查通过后发布，关闭时仅保留构建产物
         type: boolean
         default: false
+      signing_mode:
+        description: Windows 代码签名；unsigned 沿用现有内网发行方式
+        type: choice
+        options: [unsigned, production]
+        default: unsigned
 
 permissions:
   contents: read
@@ -27,21 +32,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: windows-2022
+            platform: win
           - os: macos-15
             platform: mac
-            extension: dmg
           - os: ubuntu-24.04
             platform: linux
-            extension: deb
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     env:
       DESKTOP_VERSION: ${{ inputs.version }}
       DESKTOP_COMMIT: ${{ inputs.commit_sha }}
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      DESKTOP_CONTROL_PLANE_URL: http://www.instudio.me:6206/traefik/ai-rpa/cp
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - name: 校验发布参数
-        shell: bash
         run: |
           [[ "$DESKTOP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 1
           [[ "$DESKTOP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 1
@@ -53,7 +61,6 @@ jobs:
           ssh-key: ${{ secrets.AI_RPA_SOURCE_DEPLOY_KEY }}
           persist-credentials: false
       - name: 复核源码提交
-        shell: bash
         run: |
           [[ "$(git rev-parse HEAD)" == "$DESKTOP_COMMIT" ]] || exit 1
           echo "源码提交：$DESKTOP_COMMIT" >> "$GITHUB_STEP_SUMMARY"
@@ -61,65 +68,85 @@ jobs:
         with:
           node-version: 22.18.0
           package-manager-cache: false
+      - name: 校验 Windows 稳定更新密钥
+        if: matrix.platform == 'win' && !contains(inputs.version, '-')
+        env:
+          DESKTOP_UPDATE_SIGNING_KEY: ${{ secrets.DESKTOP_UPDATE_SIGNING_KEY }}
+        run: node scripts/github/sign-desktop-update.mjs
       - name: 安装依赖与 Electron 内核
-        shell: bash
         run: |
           corepack enable
           corepack prepare pnpm@11.7.0 --activate
           pnpm install --frozen-lockfile
           node apps/desktop/node_modules/electron/install.js
       - name: 平台适配回归与静态检查
-        shell: bash
         run: |
-          pnpm --filter @ai-rpa/local-development test
-          pnpm --filter @ai-rpa/desktop test
-          pnpm --filter @ai-rpa/desktop-cli test
+          pnpm --filter @ai-rpa/local-development test --maxWorkers=1
+          pnpm --filter @ai-rpa/desktop test --maxWorkers=1
+          pnpm --filter @ai-rpa/desktop-cli test --maxWorkers=1
           pnpm --filter @ai-rpa/local-development --filter @ai-rpa/desktop --filter @ai-rpa/desktop-cli typecheck
           pnpm --filter @ai-rpa/local-development --filter @ai-rpa/desktop lint
+          pnpm exec vitest run scripts/desktop-release-workflow.test.mjs
       - name: 写入共同版本
-        shell: bash
         run: |
           node -e 'const fs = require("node:fs"); const path = "apps/desktop/package.json"; const pkg = JSON.parse(fs.readFileSync(path, "utf8")); pkg.version = process.env.DESKTOP_VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n")'
+      - name: 构建并验证 Windows
+        if: matrix.platform == 'win'
+        shell: pwsh
+        env:
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SIGNING_MODE -eq 'production') {
+            if (-not $env:WIN_CSC_LINK -or -not $env:WIN_CSC_KEY_PASSWORD) {
+              throw 'Production signing requires WIN_CSC_LINK and WIN_CSC_KEY_PASSWORD.'
+            }
+          } else {
+            Remove-Item Env:WIN_CSC_LINK -ErrorAction SilentlyContinue
+            Remove-Item Env:WIN_CSC_KEY_PASSWORD -ErrorAction SilentlyContinue
+          }
+          pnpm desktop:package:win
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging or packaged runtime smoke test failed.' }
+          if ($env:SIGNING_MODE -eq 'production') {
+            foreach ($file in @("apps/desktop/release/xiaoyuan-rpa-desktop-setup-$env:DESKTOP_VERSION.exe", 'apps/desktop/release/win-unpacked/xiaoyuan-rpa.exe')) {
+              $signature = Get-AuthenticodeSignature -LiteralPath $file
+              if ($signature.Status -ne 'Valid' -or $null -eq $signature.TimeStamperCertificate) {
+                throw "Invalid or untimestamped Windows signature: $file"
+              }
+            }
+          }
       - name: 构建并验证 macOS
         if: matrix.platform == 'mac'
         run: pnpm desktop:package:mac
       - name: 准备 Ubuntu 桌面依赖
         if: matrix.platform == 'linux'
-        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y gnome-keyring dbus-x11 libsecret-1-0 libgtk-3-0t64 libnss3 libgbm1 libasound2t64 fonts-noto-cjk
+          sudo apt-get install -y gnome-keyring dbus-x11 systemd libsecret-1-0 libgtk-3-0t64 libnss3 libgbm1 libasound2t64 fonts-noto-cjk binutils xz-utils
           test -x /usr/bin/google-chrome
       - name: 构建并验证 Ubuntu
         if: matrix.platform == 'linux'
-        shell: bash
+        env:
+          KERNEL_PATH: /usr/bin/google-chrome
         run: |
           dbus-run-session -- bash -euo pipefail -c '
             printf "%s" "isolated-ci-keyring" | gnome-keyring-daemon --unlock --components=secrets
+            gnome-keyring-daemon --start --components=secrets
+            busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus StartServiceByName su org.freedesktop.secrets 0
             pnpm desktop:package:linux
           '
-      - name: 校验安装产物
-        shell: bash
+          deb="apps/desktop/release/xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"
+          [[ "$(dpkg-deb -f "$deb" Architecture)" == amd64 ]]
+          dpkg-deb -c "$deb" > /tmp/desktop-package-files
+          grep -q './usr/bin/ai-rpa$' /tmp/desktop-package-files
+      - name: 校验产物、生成摘要并签署稳定更新清单
         env:
           PLATFORM: ${{ matrix.platform }}
-          EXTENSION: ${{ matrix.extension }}
-        run: |
-          shopt -s nullglob
-          packages=(apps/desktop/release/*.$EXTENSION)
-          [[ ${#packages[@]} -eq 1 ]] || exit 1
-          expected="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg"
-          if [[ "$PLATFORM" == linux ]]; then
-            expected="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"
-            [[ "$(dpkg-deb -f "${packages[0]}" Architecture)" == amd64 ]]
-            dpkg-deb -c "${packages[0]}" > /tmp/desktop-package-files
-            grep -q './usr/bin/ai-rpa$' /tmp/desktop-package-files
-          fi
-          [[ "$(basename "${packages[0]}")" == "$expected" ]]
-          mkdir -p release-upload
-          cp "${packages[0]}" release-upload/
-          (cd release-upload && shasum -a 256 "$expected" > "$expected.sha256")
-          cat "release-upload/$expected.sha256" >> "$GITHUB_STEP_SUMMARY"
-      - name: 仅保存安装包与校验值
+          DESKTOP_UPDATE_SIGNING_KEY: ${{ matrix.platform == 'win' && secrets.DESKTOP_UPDATE_SIGNING_KEY || '' }}
+        run: node scripts/github/prepare-desktop-release.mjs
+      - name: 仅保存安装包、摘要与签名清单
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.platform }}
@@ -143,18 +170,22 @@ jobs:
           pattern: desktop-*
           merge-multiple: true
           path: release-upload
-      - name: 发布两端共同的 Pre-release
+      - name: 三端产物全部通过后发布同一版本
         shell: bash
         run: |
           cd release-upload
-          dmg="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg"
-          deb="xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"
-          test -s "$dmg" && test -s "$deb"
-          sha256sum -c "$dmg.sha256" "$deb.sha256"
-          printf 'macOS Apple Silicon 与 Ubuntu 24.04 x86_64 内部验收版。\n\n共同源码提交：%s。\n\nmacOS 尚未进行 Apple Developer ID 签名或公证。Ubuntu 使用 DEB 安装，包含 ai-rpa CLI，需要已登录并解锁密钥环的桌面会话。\n' "$DESKTOP_COMMIT" > /tmp/release-notes.md
-          gh release create "desktop-mac-v${DESKTOP_VERSION}" \
-            "$dmg#macOS Apple Silicon DMG" "$dmg.sha256#macOS SHA-256" \
-            "$deb#Ubuntu x86_64 DEB" "$deb.sha256#Ubuntu SHA-256" \
+          for file in "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.exe" "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg" "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"; do
+            test -s "$file"
+            sha256sum -c "$file.sha256"
+          done
+          flags=(--latest)
+          if [[ "$DESKTOP_VERSION" == *-* ]]; then
+            flags=(--prerelease --latest=false)
+          else
+            test -s latest.json
+          fi
+          printf 'Windows x64、macOS Apple Silicon 与 Ubuntu x64。\n\n共同源码提交：%s。\n\nWindows 稳定更新清单使用原 Ed25519 密钥签名；默认 Windows 内网发行不含 Authenticode 证书。macOS 尚未进行 Apple Developer ID 签名或公证。Ubuntu 需要已登录且解锁密钥环的桌面会话。\n' "$DESKTOP_COMMIT" > /tmp/release-notes.md
+          gh release create "desktop-mac-v${DESKTOP_VERSION}" ./* \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "xiaoyuan-rpa ${DESKTOP_VERSION} for macOS and Ubuntu" \
-            --notes-file /tmp/release-notes.md --prerelease
+            --title "xiaoyuan-rpa ${DESKTOP_VERSION}" \
+            --notes-file /tmp/release-notes.md "${flags[@]}"
