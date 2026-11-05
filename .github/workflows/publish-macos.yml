@@ -1,4 +1,5 @@
 name: 发布 Windows 与 macOS 桌面端
+run-name: desktop ${{ inputs.version }} ${{ inputs.commit_sha }} ${{ inputs.signing_mode }}
 
 on:
   workflow_dispatch:
@@ -12,7 +13,7 @@ on:
         required: true
         type: string
       publish:
-        description: 两端检查通过后发布，关闭时仅保留构建产物
+        description: 两端检查通过后准备已校验草稿；公开发布由 Gitea 交付流程完成
         type: boolean
         default: false
       signing_mode:
@@ -44,6 +45,7 @@ jobs:
     env:
       DESKTOP_VERSION: ${{ inputs.version }}
       DESKTOP_COMMIT: ${{ inputs.commit_sha }}
+      SIGNING_MODE: ${{ inputs.signing_mode }}
       DESKTOP_CONTROL_PLANE_URL: http://www.instudio.me:6206/traefik/ai-rpa/cp
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
@@ -123,7 +125,7 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
           DESKTOP_UPDATE_SIGNING_KEY: ${{ matrix.platform == 'win' && secrets.DESKTOP_UPDATE_SIGNING_KEY || '' }}
         run: node scripts/github/prepare-desktop-release.mjs
-      - name: 仅保存安装包、摘要与签名清单
+      - name: 保存安装包、摘要、签名清单与构建来源
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.platform }}
@@ -140,29 +142,24 @@ jobs:
     env:
       DESKTOP_VERSION: ${{ inputs.version }}
       DESKTOP_COMMIT: ${{ inputs.commit_sha }}
+      SIGNING_MODE: ${{ inputs.signing_mode }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: 检出同一源码中的发布校验工具
+        uses: actions/checkout@v5
+        with:
+          repository: cj620/ai-rpa
+          ref: ${{ inputs.commit_sha }}
+          ssh-key: ${{ secrets.AI_RPA_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.18.0
+          package-manager-cache: false
       - uses: actions/download-artifact@v4
         with:
           pattern: desktop-*
           merge-multiple: true
           path: release-upload
-      - name: 两端产物全部通过后发布同一版本
-        shell: bash
-        run: |
-          cd release-upload
-          for file in "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.exe" "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg"; do
-            test -s "$file"
-            sha256sum -c "$file.sha256"
-          done
-          flags=(--latest)
-          if [[ "$DESKTOP_VERSION" == *-* ]]; then
-            flags=(--prerelease --latest=false)
-          else
-            test -s latest.json
-          fi
-          printf 'Windows x64 与 macOS Apple Silicon。\n\n共同源码提交：%s。\n\nWindows 稳定更新清单使用原 Ed25519 密钥签名；默认 Windows 内网发行不含 Authenticode 证书。macOS 尚未进行 Apple Developer ID 签名或公证。Ubuntu 已停止维护，不再提供新版本安装包。\n' "$DESKTOP_COMMIT" > /tmp/release-notes.md
-          gh release create "desktop-mac-v${DESKTOP_VERSION}" ./* \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "xiaoyuan-rpa ${DESKTOP_VERSION}" \
-            --notes-file /tmp/release-notes.md "${flags[@]}"
+      - name: 校验两端来源、上传并回读验证 GitHub 草稿
+        run: node scripts/github/stage-desktop-release.mjs
