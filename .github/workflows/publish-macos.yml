@@ -1,10 +1,10 @@
-name: 发布 Windows、macOS 与 Ubuntu 桌面端
+name: 发布 Windows 与 macOS 桌面端
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 三端共同使用的语义版本号，不带 v 前缀
+        description: 两端共同使用的语义版本号，不带 v 前缀
         required: true
         type: string
       commit_sha:
@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       publish:
-        description: 三端检查通过后发布，关闭时仅保留构建产物
+        description: 两端检查通过后发布，关闭时仅保留构建产物
         type: boolean
         default: false
       signing_mode:
@@ -36,8 +36,6 @@ jobs:
             platform: win
           - os: macos-15
             platform: mac
-          - os: ubuntu-24.04
-            platform: linux
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -120,27 +118,6 @@ jobs:
       - name: 构建并验证 macOS
         if: matrix.platform == 'mac'
         run: pnpm desktop:package:mac
-      - name: 准备 Ubuntu 桌面依赖
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gnome-keyring dbus-x11 systemd libsecret-1-0 libgtk-3-0t64 libnss3 libgbm1 libasound2t64 fonts-noto-cjk binutils xz-utils
-          test -x /usr/bin/google-chrome
-      - name: 构建并验证 Ubuntu
-        if: matrix.platform == 'linux'
-        env:
-          KERNEL_PATH: /usr/bin/google-chrome
-        run: |
-          dbus-run-session -- bash -euo pipefail -c '
-            printf "%s" "isolated-ci-keyring" | gnome-keyring-daemon --unlock --components=secrets
-            gnome-keyring-daemon --start --components=secrets
-            busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus StartServiceByName su org.freedesktop.secrets 0
-            pnpm desktop:package:linux
-          '
-          deb="apps/desktop/release/xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"
-          [[ "$(dpkg-deb -f "$deb" Architecture)" == amd64 ]]
-          dpkg-deb -c "$deb" > /tmp/desktop-package-files
-          grep -q './usr/bin/ai-rpa$' /tmp/desktop-package-files
       - name: 校验产物、生成摘要并签署稳定更新清单
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -170,11 +147,11 @@ jobs:
           pattern: desktop-*
           merge-multiple: true
           path: release-upload
-      - name: 三端产物全部通过后发布同一版本
+      - name: 两端产物全部通过后发布同一版本
         shell: bash
         run: |
           cd release-upload
-          for file in "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.exe" "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg" "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}-linux-x64.deb"; do
+          for file in "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.exe" "xiaoyuan-rpa-desktop-setup-${DESKTOP_VERSION}.dmg"; do
             test -s "$file"
             sha256sum -c "$file.sha256"
           done
@@ -184,7 +161,7 @@ jobs:
           else
             test -s latest.json
           fi
-          printf 'Windows x64、macOS Apple Silicon 与 Ubuntu x64。\n\n共同源码提交：%s。\n\nWindows 稳定更新清单使用原 Ed25519 密钥签名；默认 Windows 内网发行不含 Authenticode 证书。macOS 尚未进行 Apple Developer ID 签名或公证。Ubuntu 需要已登录且解锁密钥环的桌面会话。\n' "$DESKTOP_COMMIT" > /tmp/release-notes.md
+          printf 'Windows x64 与 macOS Apple Silicon。\n\n共同源码提交：%s。\n\nWindows 稳定更新清单使用原 Ed25519 密钥签名；默认 Windows 内网发行不含 Authenticode 证书。macOS 尚未进行 Apple Developer ID 签名或公证。Ubuntu 已停止维护，不再提供新版本安装包。\n' "$DESKTOP_COMMIT" > /tmp/release-notes.md
           gh release create "desktop-mac-v${DESKTOP_VERSION}" ./* \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "xiaoyuan-rpa ${DESKTOP_VERSION}" \
